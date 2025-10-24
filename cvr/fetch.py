@@ -1,5 +1,7 @@
 import argparse
 import requests
+import xml.etree.ElementTree as ET
+from io import BytesIO
 
 BASE_URL = "https://datacvr.virk.dk"
 CVR_SEARCH_URL = f"{BASE_URL}/gateway/soeg/fritekst"
@@ -16,6 +18,18 @@ HEADERS = {
 session = requests.Session()
 session.headers.update(HEADERS)
 session.get(BASE_URL)  # initialize cookies
+
+
+ASSET_TAGS = {
+    "e:FixturesAndFittingsToolsAndEquipment": "Fixtures, fittings, tools and equipment",
+    "e:OtherTangibleFixedAssets": "Other tangible fixed assets",
+    "e:Inventories": "Inventories",
+    "fsa:RawMaterialsAndConsumables": "Inventories (Raw materials and consumables)",
+    "fsa:FinishedGoodsAndGoodsForResale": "Inventories (Finished goods and resale)",
+    "e:LandAndBuildings": "Land and buildings",
+    "e:Vehicles": "Vehicles",
+    "e:TangibleFixedAssets": "Tangible fixed assets, total",
+}
 
 
 def search_company(name: str):
@@ -62,16 +76,58 @@ def find_latest_xbrl(company_data, cvr: str):
     for ref in regnskab.get("dokumentreferencer", []):
         if ref["indholdstype"].upper() == "XML":
             dokument_id = ref["dokumentId"]
-            xbrl_url = f"{BASE_URL}/gateway/dokument/downloadDokumentForVirksomhed?dokumentId={dokument_id}&cvrNummer={cvr}"
-            print(f"✅ Found XBRL document:\n{xbrl_url}")
-            return xbrl_url
+            url_gateway = f"{BASE_URL}/gateway/dokument/downloadDokumentForVirksomhed?dokumentId={dokument_id}&cvrNummer={cvr}"
+            url_public = f"{BASE_URL}/dokument/{dokument_id}"
+            print(f"✅ Found XBRL document ID: {dokument_id}")
+            return url_gateway, url_public
 
     print("⚠️ No XBRL (XML) document found in latest regnskab.")
-    return None
+    return None, None
+
+
+def download_xbrl(url_gateway: str, url_public: str):
+    """Try to download XML via gateway first, fallback to public /dokument URL."""
+    urls = [url_gateway, url_public]
+
+    for url in urls:
+        print(f"📥 Trying: {url}")
+        r = session.get(url, allow_redirects=True)
+        if r.status_code == 200 and "xml" in r.headers.get("Content-Type", "").lower():
+            print("✅ Successfully downloaded XBRL XML.")
+            return r.content
+        elif r.status_code == 403:
+            print("⚠️ Forbidden, trying next fallback...")
+            continue
+
+    raise RuntimeError("❌ Unable to download XBRL XML from any URL.")
+
+
+def parse_xbrl_assets(xml_content: bytes):
+    """Extract tangible asset fields from XBRL XML."""
+    tree = ET.parse(BytesIO(xml_content))
+    root = tree.getroot()
+
+    results = []
+
+    for tag, name in ASSET_TAGS.items():
+        local_tag = tag.split(":")[1]
+        values = []
+        for el in root.iter():
+            if el.tag.endswith(local_tag):
+                try:
+                    value = float(el.text.strip().replace(",", "."))
+                    values.append(value)
+                except (ValueError, AttributeError):
+                    continue
+
+        if values:
+            results.append((tag, name, max(values)))
+
+    return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fetch latest XBRL report for insolvent Danish company.")
+    parser = argparse.ArgumentParser(description="Fetch and parse latest XBRL for an insolvent Danish company.")
     parser.add_argument("--company", required=True, help="Company name to search for")
     args = parser.parse_args()
 
@@ -80,7 +136,18 @@ def main():
         return
 
     data = fetch_company_data(cvr)
-    find_latest_xbrl(data, cvr)
+    url_gateway, url_public = find_latest_xbrl(data, cvr)
+    if not url_gateway:
+        return
+
+    xml_data = download_xbrl(url_gateway, url_public)
+    assets = parse_xbrl_assets(xml_data)
+
+    print("\n📊 Tangible Asset Overview:\n")
+    print("| XBRL Field | English Name | Value (DKK) |")
+    print("|-------------|--------------|--------------|")
+    for tag, name, value in assets:
+        print(f"| {tag} | {name} | {value:,.0f} |")
 
 
 if __name__ == "__main__":
