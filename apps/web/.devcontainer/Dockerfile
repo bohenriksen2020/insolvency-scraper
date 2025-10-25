@@ -1,23 +1,25 @@
-# Use Microsoft’s Dev Container Node base image
-FROM mcr.microsoft.com/devcontainers/typescript-node:20
+FROM mcr.microsoft.com/devcontainers/typescript-node:22-bookworm
 
+# Enable pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+# Work in project directory
 WORKDIR /workspace
 
-# Enable corepack (ships with Node)
-RUN corepack enable \
-    && corepack prepare pnpm@10.19.0 --activate
+# Copy dependencies first for caching
+COPY package*.json ./
+COPY pnpm-lock.yaml* ./
 
-# Copy lockfile and manifest first (for build cache)
+# Fix file permission issues for non-root installs
+USER root
+RUN mkdir -p /workspace && chown -R node:node /workspace
+USER node
+
+# Install dependencies
+RUN pnpm install --frozen-lockfile --prefer-offline || pnpm rebuild @next/swc-linux-arm64-gnu
+
+# Copy source
 COPY . .
 
-# Install dependencies using pnpm
-RUN pnpm install --frozen-lockfile
-
-# Copy project files
-COPY . .
-
-# Expose web port
 EXPOSE 3000
-
-# Default command for dev mode (can override in compose)
 CMD ["pnpm", "dev"]

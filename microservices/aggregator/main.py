@@ -1,3 +1,5 @@
+# Aggregator
+
 from fastapi import FastAPI, BackgroundTasks
 from datetime import date
 import requests
@@ -5,17 +7,18 @@ import logging
 import random
 import time
 
-from .db import SessionLocal, init_db
-from .models import Company, Lawyer, InsolvencyCase
-from .scheduler import start_scheduler
+from db import SessionLocal, init_db
+import os
+from models import Company, Lawyer, InsolvencyCase
+from scheduler import start_scheduler
 
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Aggregator Service")
 
-STATSTIDENDE = "http://statstidende:8000"
-CVR = "http://cvr:8000"
-ADVOKAT = "http://advokatnoeglen:8000"
+STATSTIDENDE_URL = os.getenv("STATSTIDENDE_URL", "http://statstidende:8001")
+CVR_URL = os.getenv("CVR_URL", "http://cvr:8000")
+ADVOKAT_URL = os.getenv("ADVOKAT_URL", "http://advokatnoeglen:8003")
 
 init_db()
 start_scheduler()
@@ -37,7 +40,7 @@ def run_daily_sync(date_iso: str | None = None) -> None:
     logging.info(f"🔄 Running sync for {date_iso}")
 
     try:
-        response = requests.get(f"{STATSTIDENDE}/insolvencies/{date_iso}", timeout=30)
+        response = requests.get(f"{STATSTIDENDE_URL}/insolvencies/{date_iso}", timeout=30)
         response.raise_for_status()
         insolvencies = response.json().get("results", [])
     except Exception as exc:  # pragma: no cover - network errors
@@ -54,7 +57,7 @@ def run_daily_sync(date_iso: str | None = None) -> None:
         assets = []
         if cvr:
             try:
-                cvr_response = requests.get(f"{CVR}/assets/{cvr}", timeout=30)
+                cvr_response = requests.get(f"{CVR_URL}/assets/{cvr}", timeout=30)
                 cvr_response.raise_for_status()
                 cvr_data = cvr_response.json()
                 assets = cvr_data.get("assets", [])
@@ -75,7 +78,7 @@ def run_daily_sync(date_iso: str | None = None) -> None:
         if lawyer_name:
             try:
                 lawyer_response = requests.get(
-                    f"{ADVOKAT}/lawyer",
+                    f"{ADVOKAT_URL}/lawyer",
                     params={"name": lawyer_name},
                     timeout=30,
                 )

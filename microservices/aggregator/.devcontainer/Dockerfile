@@ -3,7 +3,7 @@ FROM mcr.microsoft.com/devcontainers/python:3.12-bookworm
 WORKDIR /workspace
 
 # Install FastAPI & Uvicorn
-RUN pip install --no-cache-dir fastapi uvicorn httpx python-dotenv
+RUN pip install --no-cache-dir fastapi uvicorn httpx python-dotenv requests SQLAlchemy psycopg2 psycopg2-binary apscheduler
 
 # Copy the local code into the container
 # (VS Code also mounts it live, so this helps for build-time commands)
@@ -17,4 +17,7 @@ RUN chown -R vscode:vscode /workspace
 EXPOSE 8002
 
 # Run the FastAPI app on container startup
-CMD ["python", "app.py"]
+# Run the FastAPI app on container startup
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
+
+
