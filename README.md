@@ -7,12 +7,13 @@ frontend with Python microservices that ingest Danish insolvency data sources.
 
 ```
 insolvency-intelligence/
-├── apps/web                 # Next.js frontend
-├── microservices/aggregator # Public aggregation API
-├── microservices/cvr        # CVR gateway wrapper
-├── microservices/statstidende # Statstidende scraper API
-├── libs/shared-types        # Placeholder for shared models
-└── infra                    # Docker Compose + reverse proxy
+├── apps/web                     # Next.js frontend
+├── microservices/statstidende   # Statstidende scraper API to fetch the latest insolvency companies per date. 
+├── microservices/advokatnoeglen # Find a lawyer by name
+├── microservices/cvr            # CVR gateway wrapper - get company name and asset list
+├── microservices/aggregator     # Public aggregation API
+├── libs/shared-types            # Placeholder for shared models
+└── infra                        # Docker Compose + reverse proxy
 ```
 
 ## Getting started

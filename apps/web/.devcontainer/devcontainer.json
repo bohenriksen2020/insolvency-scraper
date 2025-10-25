@@ -1,7 +1,14 @@
 {
   "name": "insolvency-web",
-  "image": "mcr.microsoft.com/devcontainers/typescript-node:20",
-  "postCreateCommand": "npm install",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "node",
+  "overrideCommand": false,
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "workspaceFolder": "/workspace",
+  "runArgs": ["--init", "-p", "3000:3000"],
   "customizations": {
     "vscode": {
       "settings": {
@@ -9,8 +16,10 @@
       },
       "extensions": [
         "dbaeumer.vscode-eslint",
-        "esbenp.prettier-vscode"
+        "esbenp.prettier-vscode",
+        "pnpm.pnpm-vscode-extension"
       ]
     }
-  }
+  },
+  "postCreateCommand": "corepack enable && pnpm install && echo '✅ Insolvency web ready on http://localhost:3000'"
 }

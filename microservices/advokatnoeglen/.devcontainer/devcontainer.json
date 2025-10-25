@@ -1,0 +1,18 @@
+{
+  "name": "cvr-service",
+  "build": { "dockerfile": "Dockerfile" },
+  "remoteUser": "vscode",
+  "overrideCommand": false,
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "workspaceFolder": "/workspace",
+  "runArgs": ["--init", "-p", "8003:8003"],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ]
+    }
+  },
+  "postCreateCommand": "echo '✅ Advokatnoeglen service running at http://localhost:8003/health'"
+}
