@@ -6,3 +6,8 @@ node_modules/
 
 !infra/.env
 .next
+.env.local
+.env.prod
+
+apps/web/.pnpm-store/
+apps/web/.vscode/
