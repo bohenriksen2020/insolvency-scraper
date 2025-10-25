@@ -1,0 +1,23 @@
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+providers:
+  file:
+    watch: true
+
+http:
+  routers:
+    web-to-aggregator:
+      rule: "Host(`api.localhost`)"
+      entryPoints:
+        - web
+      service: aggregator
+      tls: false
+  services:
+    aggregator:
+      loadBalancer:
+        servers:
+          - url: "http://aggregator:8002"
