@@ -1,33 +1,46 @@
 from __future__ import annotations
 
-import os
-from typing import Any, Dict
+from fastapi import FastAPI, Query
 
-import httpx
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fetch import fetch_profile, search_name
 
-load_dotenv()
-
-
-
-app = FastAPI(title="Advokatnoeglen Service", version="0.1.0")
-
-
-async def fetch_json(client: httpx.AsyncClient, url: str, **kwargs: Any) -> Dict[str, Any]:
-    response = await client.get(url, timeout=60, **kwargs)
-    response.raise_for_status()
-    return response.json()
+app = FastAPI(title="Advokatnøglen Service")
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
+def health() -> dict[str, str]:
+    """Simple health check endpoint."""
     return {"status": "ok"}
 
 
+@app.get("/lawyer")
+def get_lawyer(
+    name: str = Query(..., description="Full name of the lawyer to search for"),
+) -> dict[str, object]:
+    """Search Advokatnøglen by name and return parsed profile data."""
+    search = search_name(name)
+    results: list[dict[str, object]] = []
+
+    for item in search.get("results", []):
+        url = item.get("profile_url")
+        if not url:
+            continue
+
+        try:
+            profile = fetch_profile(url)
+            results.append({**item, "profile": profile})
+        except Exception as exc:  # pragma: no cover - defensive logging
+            results.append({**item, "error": f"{type(exc).__name__}: {exc}"})
+
+    return {
+        "query_name": name,
+        "count": len(results),
+        "results": results,
+        "search_url": search.get("search_url"),
+    }
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - convenience for local running
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8002")), reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
