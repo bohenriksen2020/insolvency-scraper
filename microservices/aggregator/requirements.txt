@@ -6,3 +6,4 @@ SQLAlchemy==2.0.29
 psycopg2-binary==2.9.9
 apscheduler==3.10.4
 pytz==2024.1
+requests==2.32.3
