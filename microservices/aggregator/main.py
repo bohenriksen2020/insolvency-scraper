@@ -1,310 +1,155 @@
-from __future__ import annotations
-
+from fastapi import FastAPI, BackgroundTasks
+from datetime import date
+import requests
 import logging
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+import random
+import time
 
-from fastapi import Depends, FastAPI, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from .db import SessionLocal, init_db
+from .models import Company, Lawyer, InsolvencyCase
+from .scheduler import start_scheduler
 
-from .db import Base, SessionLocal, engine, session_scope
-from .models import CompanyAssets, Insolvency, InsolvencyLawyer, Lawyer
-from .scheduler import shutdown_scheduler, start_scheduler
-from .services.advokat import AdvokatService
-from .services.cvr import CvrService
-from .services.statstidende import StatstidendeService
-from .utils import parse_date
+logging.basicConfig(level=logging.INFO)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger(__name__)
+app = FastAPI(title="Aggregator Service")
 
-app = FastAPI(title="Insolvency Aggregator", version="1.0.0")
+STATSTIDENDE = "http://statstidende:8000"
+CVR = "http://cvr:8000"
+ADVOKAT = "http://advokatnoeglen:8000"
 
-statstidende_service = StatstidendeService()
-advokat_service = AdvokatService()
-cvr_service = CvrService()
+init_db()
+start_scheduler()
 
 
-class LawyerResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    name: Optional[str]
-    firm: Optional[str]
-    address: Optional[str] = None
-    email: Optional[str] = None
-    phone: Optional[str] = None
-    website: Optional[str] = None
-
-
-class AssetResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    cvr: Optional[str]
-    tangible_assets: Optional[float] = None
-    fixtures: Optional[float] = None
-    inventories: Optional[float] = None
-    vehicles: Optional[float] = None
-    land_buildings: Optional[float] = None
-    updated_at: Optional[datetime] = None
-
-
-class InsolvencyResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    cvr: Optional[str]
-    company_name: Optional[str]
-    court: Optional[str]
-    date_declared: Optional[date]
-    lawyer_name: Optional[str]
-    lawyer_firm: Optional[str]
-    created_at: Optional[datetime]
-    lawyers: List[LawyerResponse] = Field(default_factory=list)
-    assets: Optional[AssetResponse] = None
-
-
-class LawyerCasesResponse(BaseModel):
-    lawyer: LawyerResponse
-    insolvencies: List[InsolvencyResponse]
-
-
-class SummaryBucket(BaseModel):
-    key: str
-    count: int
-
-
-class DashboardSummaryResponse(BaseModel):
-    by_date: List[SummaryBucket]
-    by_court: List[SummaryBucket]
-
-
-def get_db() -> Session:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-def _get_or_create_lawyer(db: Session, name: Optional[str], firm: Optional[str]) -> Optional[Lawyer]:
-    if not name:
-        return None
-    normalized_name = name.strip()
-    if not normalized_name:
-        return None
-    lawyer = (
-        db.query(Lawyer)
-        .filter(func.lower(Lawyer.name) == normalized_name.lower())
-        .first()
-    )
-    if not lawyer:
-        lawyer = Lawyer(name=normalized_name, firm=firm)
-        db.add(lawyer)
-        db.flush()
-    return lawyer
-
-
-def _enrich_lawyer(db: Session, lawyer: Lawyer) -> None:
-    if not lawyer or (lawyer.email and lawyer.phone and lawyer.address):
-        return
-    try:
-        details = advokat_service.fetch_lawyer(lawyer.name or "")
-    except Exception:  # pragma: no cover - network error
-        logger.exception("Failed to enrich lawyer", extra={"name": lawyer.name})
-        return
-    if not details:
-        return
-    lawyer.firm = details.get("firm") or lawyer.firm
-    lawyer.address = details.get("address") or lawyer.address
-    lawyer.email = details.get("email") or lawyer.email
-    lawyer.phone = details.get("phone") or lawyer.phone
-    lawyer.website = details.get("website") or lawyer.website
-
-
-def _link_lawyer(db: Session, insolvency: Insolvency, lawyer: Lawyer) -> None:
-    if not lawyer:
-        return
-    exists = (
-        db.query(InsolvencyLawyer)
-        .filter(
-            InsolvencyLawyer.insolvency_id == insolvency.id,
-            InsolvencyLawyer.lawyer_id == lawyer.id,
-        )
-        .first()
-    )
-    if not exists:
-        db.add(InsolvencyLawyer(insolvency_id=insolvency.id, lawyer_id=lawyer.id))
-
-
-def _upsert_assets(db: Session, cvr: Optional[str]) -> None:
-    if not cvr:
-        return
-    try:
-        payload = cvr_service.fetch_company(cvr)
-    except Exception:  # pragma: no cover - network error
-        logger.exception("Failed to fetch company assets", extra={"cvr": cvr})
-        return
-    if not payload:
-        return
-    assets_data = cvr_service.extract_assets(payload)
-    assets = db.query(CompanyAssets).filter_by(cvr=cvr).one_or_none()
-    if not assets:
-        assets = CompanyAssets(cvr=cvr, **assets_data)
-        db.add(assets)
-    else:
-        for field, value in assets_data.items():
-            setattr(assets, field, value)
-
-
-def fetch_daily_insolvencies(target_date: Optional[str] = None) -> Dict[str, Any]:
-    logger.info("Starting insolvency ingestion", extra={"date": target_date})
-    try:
-        records = statstidende_service.fetch_insolvencies(target_date)
-    except Exception:  # pragma: no cover - network error
-        logger.exception("Failed to fetch insolvencies from Statstidende")
-        return {"fetched": 0, "created": 0, "updated": 0}
-    created = 0
-    updated = 0
-
-    with session_scope() as db:
-        for item in records:
-            cvr = item.get("cvr")
-            if not cvr:
-                logger.warning("Skipping insolvency without CVR", extra={"payload": item})
-                continue
-            try:
-                declared = parse_date(item.get("date_declared"))
-            except ValueError:
-                logger.warning(
-                    "Skipping insolvency due to unparseable date",
-                    extra={"cvr": cvr, "date": item.get("date_declared")},
-                )
-                continue
-            insolvency = (
-                db.query(Insolvency)
-                .filter(Insolvency.cvr == cvr, Insolvency.date_declared == declared)
-                .one_or_none()
-            )
-            if not insolvency:
-                insolvency = Insolvency(
-                    cvr=cvr,
-                    company_name=item.get("company_name"),
-                    court=item.get("court"),
-                    date_declared=declared,
-                    lawyer_name=item.get("lawyer_name"),
-                    lawyer_firm=item.get("lawyer_firm"),
-                )
-                db.add(insolvency)
-                db.flush()
-                created += 1
-            else:
-                insolvency.company_name = item.get("company_name") or insolvency.company_name
-                insolvency.court = item.get("court") or insolvency.court
-                insolvency.lawyer_name = item.get("lawyer_name") or insolvency.lawyer_name
-                insolvency.lawyer_firm = item.get("lawyer_firm") or insolvency.lawyer_firm
-                updated += 1
-
-            lawyer = _get_or_create_lawyer(db, insolvency.lawyer_name, insolvency.lawyer_firm)
-            if lawyer:
-                _enrich_lawyer(db, lawyer)
-                _link_lawyer(db, insolvency, lawyer)
-
-            _upsert_assets(db, cvr)
-
-    logger.info("Completed insolvency ingestion", extra={"created": created, "updated": updated})
-    return {"fetched": len(records), "created": created, "updated": updated}
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    logger.info("Creating database tables if they do not exist")
-    Base.metadata.create_all(bind=engine)
-    start_scheduler(fetch_daily_insolvencies)
-    fetch_daily_insolvencies()
-
-
-@app.on_event("shutdown")
-def on_shutdown() -> None:
-    shutdown_scheduler()
-    statstidende_service.close()
-    advokat_service.close()
-    cvr_service.close()
+def safe_sleep(min_s: float = 0.5, max_s: float = 1.5) -> None:
+    """Jittered sleep to avoid overloading APIs."""
+    time.sleep(random.uniform(min_s, max_s))
 
 
 @app.get("/health")
-def health() -> Dict[str, str]:
+def health() -> dict:
     return {"status": "ok"}
 
 
-@app.get("/api/insolvencies/recent", response_model=List[InsolvencyResponse])
-def recent_insolvencies(
-    limit: int = Query(50, ge=1, le=500),
-    db: Session = Depends(get_db),
-) -> List[InsolvencyResponse]:
-    insolvencies = (
-        db.query(Insolvency)
-        .options(joinedload(Insolvency.lawyers), joinedload(Insolvency.assets))
-        .order_by(Insolvency.date_declared.desc(), Insolvency.created_at.desc())
-        .limit(limit)
+def run_daily_sync(date_iso: str | None = None) -> None:
+    session = SessionLocal()
+    date_iso = date_iso or date.today().isoformat()
+    logging.info(f"🔄 Running sync for {date_iso}")
+
+    try:
+        response = requests.get(f"{STATSTIDENDE}/insolvencies/{date_iso}", timeout=30)
+        response.raise_for_status()
+        insolvencies = response.json().get("results", [])
+    except Exception as exc:  # pragma: no cover - network errors
+        logging.error(f"❌ Failed fetching Statstidende data: {exc}")
+        session.close()
+        return
+
+    for index, case in enumerate(insolvencies, start=1):
+        cvr = case.get("cvr")
+        lawyer_name = case.get("lawyer_name")
+        logging.info(f"→ [{index}/{len(insolvencies)}] {case.get('company_name')}")
+
+        # --- CVR enrichment ---
+        assets = []
+        if cvr:
+            try:
+                cvr_response = requests.get(f"{CVR}/assets/{cvr}", timeout=30)
+                cvr_response.raise_for_status()
+                cvr_data = cvr_response.json()
+                assets = cvr_data.get("assets", [])
+                company = Company(
+                    cvr=cvr,
+                    name=case.get("company_name"),
+                    status="UNDERKONKURS",
+                    assets=assets,
+                )
+                session.merge(company)
+                safe_sleep(0.8, 1.5)
+            except Exception as exc:  # pragma: no cover - network errors
+                logging.warning(f"⚠️ CVR failed for {cvr}: {exc}")
+                safe_sleep(1.0, 2.0)
+
+        # --- Lawyer enrichment ---
+        lawyer_id = None
+        if lawyer_name:
+            try:
+                lawyer_response = requests.get(
+                    f"{ADVOKAT}/lawyer",
+                    params={"name": lawyer_name},
+                    timeout=30,
+                )
+                lawyer_response.raise_for_status()
+                lawyer_data = lawyer_response.json()
+                results = lawyer_data.get("results", [])
+                if results:
+                    profile = results[0].get("profile", {})
+                    firm = profile.get("firm", {})
+                    lawyer = Lawyer(
+                        name=profile.get("name"),
+                        firm=firm.get("name"),
+                        city=firm.get("city"),
+                        email=profile.get("email"),
+                        cvr=firm.get("cvr"),
+                        phone=firm.get("phone"),
+                    )
+                    session.add(lawyer)
+                    session.flush()
+                    lawyer_id = lawyer.id
+                safe_sleep(1.2, 2.5)
+            except Exception as exc:  # pragma: no cover - network errors
+                logging.warning(f"⚠️ Lawyer lookup failed for {lawyer_name}: {exc}")
+                safe_sleep(1.0, 2.0)
+
+        insolvency = InsolvencyCase(
+            message_number=case.get("messageNumber"),
+            publication_date=case.get("publicationDate"),
+            company_name=case.get("company_name"),
+            cvr=cvr,
+            court=case.get("court"),
+            lawyer_id=lawyer_id,
+            raw=case,
+        )
+        session.add(insolvency)
+        session.commit()
+
+        safe_sleep(0.3, 0.8)
+
+    session.close()
+    logging.info(f"✅ Completed sync for {len(insolvencies)} insolvencies on {date_iso}")
+
+
+@app.post("/sync/today")
+def sync_today(background_tasks: BackgroundTasks) -> dict:
+    background_tasks.add_task(run_daily_sync)
+    return {"message": "Daily sync started"}
+
+
+@app.post("/sync/{date_iso}")
+def sync_date(date_iso: str, background_tasks: BackgroundTasks) -> dict:
+    background_tasks.add_task(run_daily_sync, date_iso)
+    return {"message": f"Sync started for {date_iso}"}
+
+
+@app.get("/insolvencies/recent")
+def get_recent() -> dict:
+    session = SessionLocal()
+    rows = (
+        session.query(InsolvencyCase)
+        .order_by(InsolvencyCase.publication_date.desc())
+        .limit(50)
         .all()
     )
-    return [InsolvencyResponse.model_validate(insolvency) for insolvency in insolvencies]
-
-
-@app.get("/api/lawyers/{name}", response_model=LawyerCasesResponse)
-def get_lawyer_cases(name: str, db: Session = Depends(get_db)) -> LawyerCasesResponse:
-    normalized_name = name.strip()
-    if not normalized_name:
-        raise HTTPException(status_code=400, detail="Name must not be empty")
-    lawyer = (
-        db.query(Lawyer)
-        .filter(func.lower(Lawyer.name) == normalized_name.lower())
-        .options(joinedload(Lawyer.insolvencies))
-        .first()
-    )
-    if not lawyer:
-        raise HTTPException(status_code=404, detail="Lawyer not found")
-
-    insolvencies = (
-        db.query(Insolvency)
-        .join(InsolvencyLawyer, Insolvency.id == InsolvencyLawyer.insolvency_id)
-        .filter(InsolvencyLawyer.lawyer_id == lawyer.id)
-        .options(joinedload(Insolvency.lawyers), joinedload(Insolvency.assets))
-        .order_by(Insolvency.date_declared.desc())
-        .all()
-    )
-    return LawyerCasesResponse(
-        lawyer=LawyerResponse.model_validate(lawyer),
-        insolvencies=[InsolvencyResponse.model_validate(insolvency) for insolvency in insolvencies],
-    )
-
-
-@app.get("/api/dashboard/summary", response_model=DashboardSummaryResponse)
-def get_summary(db: Session = Depends(get_db)) -> DashboardSummaryResponse:
-    date_counts = (
-        db.query(Insolvency.date_declared, func.count(Insolvency.id))
-        .group_by(Insolvency.date_declared)
-        .order_by(Insolvency.date_declared.desc())
-        .all()
-    )
-    court_counts = (
-        db.query(Insolvency.court, func.count(Insolvency.id))
-        .group_by(Insolvency.court)
-        .order_by(func.count(Insolvency.id).desc())
-        .all()
-    )
-
-    by_date = [SummaryBucket(key=str(row[0]), count=row[1]) for row in date_counts if row[0]]
-    by_court = [SummaryBucket(key=row[0] or "Unknown", count=row[1]) for row in court_counts]
-    return DashboardSummaryResponse(by_date=by_date, by_court=by_court)
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("app:app", host="0.0.0.0", port=8002)
+    results = [
+        {
+            "id": row.id,
+            "company": row.company_name,
+            "cvr": row.cvr,
+            "court": row.court,
+            "lawyer": row.lawyer.name if row.lawyer else None,
+            "date": row.publication_date,
+        }
+        for row in rows
+    ]
+    session.close()
+    return {"count": len(results), "results": results}
