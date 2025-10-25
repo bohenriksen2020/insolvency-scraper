@@ -1,7 +1,11 @@
 {
   "name": "cvr-service",
-  "image": "mcr.microsoft.com/devcontainers/python:3.12",
-  "postCreateCommand": "pip install -r requirements.txt",
+  "build": { "dockerfile": "Dockerfile" },
+  "remoteUser": "vscode",
+  "overrideCommand": false,
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "workspaceFolder": "/workspace",
+  "runArgs": ["--init", "-p", "8000:8000"],
   "customizations": {
     "vscode": {
       "extensions": [
@@ -9,5 +13,6 @@
         "ms-python.vscode-pylance"
       ]
     }
-  }
+  },
+  "postCreateCommand": "echo '✅ CVR service running at http://localhost:8000/health'"
 }

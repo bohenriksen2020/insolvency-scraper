@@ -1,12 +1,11 @@
 {
   "name": "aggregator-service",
-  "build": {
-    "dockerfile": "Dockerfile"
-  },
+  "build": { "dockerfile": "Dockerfile" },
   "remoteUser": "vscode",
   "overrideCommand": false,
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
   "workspaceFolder": "/workspace",
+  "runArgs": ["--init", "-p", "8002:8002"],
   "customizations": {
     "vscode": {
       "extensions": [
@@ -14,5 +13,6 @@
         "ms-python.vscode-pylance"
       ]
     }
-  }
+  },
+  "postCreateCommand": "echo '✅ Aggregator service running at http://localhost:8002/health'"
 }

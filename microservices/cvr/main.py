@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-from .parse_xbrl import parse_xbrl_assets
+from parse_xbrl import parse_xbrl_assets
 
 load_dotenv()
 

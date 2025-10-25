@@ -1,8 +1,13 @@
-FROM mcr.microsoft.com/devcontainers/python:3.12-bookworm
+FROM python:3.12-slim
 
-SHELL ["/bin/bash", "-c"]
-WORKDIR /workspace
+WORKDIR /app
 
-RUN id vscode 2>/dev/null || useradd -ms /bin/bash vscode
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-ENTRYPOINT ["/bin/bash", "-l"]
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . ./
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8002"]
