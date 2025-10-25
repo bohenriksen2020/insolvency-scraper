@@ -1,23 +1,42 @@
-#!/usr/bin/env python3
-"""
-Statstidende scraper for Konkursboer / Dekret messages.
-Downloads message listings and full message JSON documents.
-"""
+from __future__ import annotations
 
 import json
+import os
 import time
-from pathlib import Path
+from functools import lru_cache
 from typing import Dict, List
-import requests
 
-BASE = "https://www.statstidende.dk"
-UA = "Mozilla/5.0 (compatible; KonkursFetcher/1.0)"
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+
+load_dotenv()
+
+BASE = os.getenv("STATSTIDENDE_BASE_URL", "https://www.statstidende.dk")
+UA = os.getenv("STATSTIDENDE_USER_AGENT", "Mozilla/5.0 (compatible; KonkursFetcher/1.0)")
 
 session = requests.Session()
 session.headers.update({
     "User-Agent": UA,
     "Accept": "application/json, text/plain, */*",
 })
+
+app = FastAPI(title="Statstidende Service", version="0.1.0")
+
+
+@lru_cache(maxsize=1)
+def _bootstrap_headers() -> None:
+    session.get(f"{BASE}/", timeout=15)
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    _bootstrap_headers()
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
 
 
 def normalize_document_inplace(message: Dict) -> Dict:
@@ -41,10 +60,7 @@ def normalize_document_inplace(message: Dict) -> Dict:
 
 
 def messagesearch_day(date_iso: str) -> Dict:
-    """
-    Robust fetch for /api/messagesearch for a single date.
-    Tries the UI's parameter combination first, then falls back.
-    """
+    """Robust fetch for /api/messagesearch for a single date."""
 
     session.headers.update({
         "Referer": f"{BASE}/messages",
@@ -99,13 +115,12 @@ def messagesearch_day(date_iso: str) -> Dict:
 
         return {"pageCount": page_count, "resultCount": len(results), "results": results}
 
-    # Try different param combinations
     attempts = [
-        (10, 40, True),   # exact UI: ps=10, o=40, with m=
-        (10, 40, False),  # remove m=
-        (20, 40, False),  # bigger page size
-        (10, 0,  False),  # different order param
-        (50, 0,  False),  # large page, minimal params
+        (10, 40, True),
+        (10, 40, False),
+        (20, 40, False),
+        (10, 0, False),
+        (50, 0, False),
     ]
 
     last_err = None
@@ -114,8 +129,8 @@ def messagesearch_day(date_iso: str) -> Dict:
             out = try_one(ps=ps, o=o, include_m=include_m)
             if out is not None:
                 return out
-        except requests.HTTPError as e:
-            last_err = e
+        except requests.HTTPError as exc:  # pragma: no cover - network fallback
+            last_err = exc
             time.sleep(0.15)
 
     if last_err:
@@ -133,65 +148,50 @@ def get_message_full(message_number: str) -> Dict:
     return payload
 
 
-def dump_konkurs_dekret(date_iso: str, out_dir: str = "out_konkurs_dekret") -> Path:
-    """Fetch Konkursboer/Dekret messages for a date and save them."""
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+@app.get("/messages/{date_iso}")
+def api_messages(date_iso: str) -> Dict:
+    try:
+        return messagesearch_day(date_iso)
+    except requests.HTTPError as exc:  # pragma: no cover - network fallback
+        raise HTTPException(status_code=exc.response.status_code, detail=str(exc)) from exc
 
-    search = messagesearch_day(date_iso)
+
+@app.get("/messages/{date_iso}/dekret")
+def api_messages_dekret(date_iso: str) -> Dict:
+    search = api_messages(date_iso)
     hits = [
-        r for r in search["results"]
-        if r.get("sectionName") == "Konkursboer"
-        and r.get("messageTypeName") == "Dekret"
+        r
+        for r in search.get("results", [])
+        if r.get("sectionName") == "Konkursboer" and r.get("messageTypeName") == "Dekret"
     ]
-    print(f"[i] {search['resultCount']} total on {date_iso}, {len(hits)} Konkursboer/Dekret")
-
-    for i, it in enumerate(hits, 1):
+    enriched = []
+    for it in hits:
         msg_no = it.get("messageNumber")
         if not msg_no:
             continue
-        try:
-            payload = get_message_full(msg_no)
-            raw_path = out_path / f"{msg_no}.raw.json"
-            raw_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-
-            msg = payload.get("message") or payload
-            snapshot = {
-                "$id": "1",
-                "sectionName": msg.get("sectionName"),
-                "messageTypeName": msg.get("messageTypeName"),
-                "messageTypeId": msg.get("messageTypeId"),
-                "messageNumber": msg.get("messageNumber"),
-                "document": msg["document"],  # string
-                "title": msg.get("title"),
-                "summaryFields": msg.get("summaryFields", []),
-                "state": msg.get("state"),
-                "logs": payload.get("logs", []),
-                "isMyMessage": msg.get("isMyMessage", False),
-                "isTeamsMessage": msg.get("isTeamsMessage", False),
-                "isMessageSearchable": msg.get("isMessageSearchable", True),
-                "publicationDate": msg.get("publicationDate"),
-                "ownerName": msg.get("ownerName", ""),
-                "publicationId": msg.get("publicationId"),
-                "submitDate": msg.get("submitDate"),
-                "hasBeenReprintedAndCorrectingMessagesIsPublished": msg.get(
-                    "hasBeenReprintedAndCorrectingMessagesIsPublished", False
-                ),
-                "concurrencyToken": msg.get("concurrencyToken"),
-            }
-            (out_path / f"{msg_no}.frontend.json").write_text(
-                json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            print(f"[✓] {i}/{len(hits)} {msg_no}")
-            time.sleep(0.35)
-        except Exception as ex:
-            print(f"[x] {msg_no}: {ex}")
-
-    return out_path
+        payload = get_message_full(msg_no)
+        msg = payload.get("message") or payload
+        snapshot = {
+            "$id": "1",
+            "sectionName": msg.get("sectionName"),
+            "messageTypeName": msg.get("messageTypeName"),
+            "messageTypeId": msg.get("messageTypeId"),
+            "messageNumber": msg.get("messageNumber"),
+            "document": msg.get("document"),
+            "title": msg.get("title"),
+            "summaryFields": msg.get("summaryFields", []),
+            "state": msg.get("state"),
+            "logs": payload.get("logs", []),
+            "publicationDate": msg.get("publicationDate"),
+            "ownerName": msg.get("ownerName", ""),
+            "publicationId": msg.get("publicationId"),
+        }
+        enriched.append(snapshot)
+        time.sleep(0.2)
+    return {"resultCount": len(enriched), "results": enriched}
 
 
 if __name__ == "__main__":
-    # Example: scrape 2025-10-24 (same date as your sample)
-    dump_konkurs_dekret("2025-10-23")
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8001")), reload=False)

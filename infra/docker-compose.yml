@@ -1,0 +1,74 @@
+version: "3.9"
+
+services:
+  traefik:
+    image: traefik:v2.11
+    command:
+      - "--providers.file.filename=/etc/traefik/traefik.yml"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+    depends_on:
+      - aggregator
+      - web
+    networks:
+      - frontend
+      - backend
+
+  cvr:
+    build:
+      context: ../microservices/cvr
+    env_file:
+      - ./.env
+    networks:
+      - backend
+    expose:
+      - "8000"
+
+  statstidende:
+    build:
+      context: ../microservices/statstidende
+    env_file:
+      - ./.env
+    networks:
+      - backend
+    expose:
+      - "8001"
+
+  aggregator:
+    build:
+      context: ../microservices/aggregator
+    env_file:
+      - ./.env
+    depends_on:
+      - cvr
+      - statstidende
+    networks:
+      - backend
+      - frontend
+    ports:
+      - "8002:8002"
+
+  web:
+    build:
+      context: ../apps/web
+    env_file:
+      - ./.env
+    depends_on:
+      - aggregator
+    environment:
+      NEXT_PUBLIC_AGGREGATOR_URL: "http://aggregator:8002"
+    networks:
+      - frontend
+    ports:
+      - "3000:3000"
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
