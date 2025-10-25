@@ -1,197 +1,130 @@
 from __future__ import annotations
 
 import json
-import os
-import time
-from functools import lru_cache
-from typing import Dict, List
+import re
+from datetime import date
+from pathlib import Path
+from typing import Any, Dict, List
 
-import requests
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 
-load_dotenv()
+from fetch import dump_konkurs_dekret
 
-BASE = os.getenv("STATSTIDENDE_BASE_URL", "https://www.statstidende.dk")
-UA = os.getenv("STATSTIDENDE_USER_AGENT", "Mozilla/5.0 (compatible; KonkursFetcher/1.0)")
+app = FastAPI(title="Statstidende Service")
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": UA,
-    "Accept": "application/json, text/plain, */*",
-})
-
-app = FastAPI(title="Statstidende Service", version="0.1.0")
+LAWYER_RE = re.compile(
+    r"Kurator:\s*(Advokat\s+)?(?P<name>[A-ZÆØÅa-zæøå\s\-]+),?\s*(?P<firm>[^,]+)?,?\s*(?P<city>[A-ZÆØÅa-zæøå]+)?",
+    re.IGNORECASE,
+)
+CVR_RE = re.compile(r"CVR-?nr\.?\:?\s*(\d{8})")
 
 
-@lru_cache(maxsize=1)
-def _bootstrap_headers() -> None:
-    session.get(f"{BASE}/", timeout=15)
+SUMMARY_MAP = {
+    "Selskab": "company_name",
+    "Navn": "company_name",
+    "CVR-nr": "cvr",
+    "CVR": "cvr",
+    "Ret": "court",
+    "Konkursbo": "company_name",
+}
 
 
-@app.on_event("startup")
-def on_startup() -> None:
-    _bootstrap_headers()
+def parse_lawyer(text: str) -> Dict[str, str]:
+    match = LAWYER_RE.search(text or "")
+    if not match:
+        return {}
+    return {
+        "lawyer_name": (match.group("name") or "").strip(),
+        "lawyer_firm": (match.group("firm") or "").strip(),
+        "lawyer_city": (match.group("city") or "").strip(),
+    }
+
+
+def extract_basic_fields(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the normalized payload returned by the API."""
+
+    serialized = json.dumps(message, ensure_ascii=False)
+    lawyer = parse_lawyer(serialized)
+    cvr_match = CVR_RE.search(serialized)
+    cvr = cvr_match.group(1) if cvr_match else None
+
+    basic = {
+        "messageNumber": message.get("messageNumber"),
+        "publicationDate": message.get("publicationDate"),
+        "company_name": message.get("title") or message.get("ownerName"),
+        "cvr": message.get("cvr") or cvr,
+        "court": message.get("court") or message.get("publicationName"),
+    }
+    basic.update(lawyer)
+
+    # Fallback from summaryFields if available
+    for summary in message.get("summaryFields", []):
+        label = summary.get("label")
+        value = summary.get("value")
+        key = SUMMARY_MAP.get(label or "")
+        if key and value and not basic.get(key):
+            basic[key] = value
+
+    return basic
+
+
+def load_message(path: Path) -> Dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    message: Dict[str, Any] | None
+    if isinstance(data, dict) and "message" in data:
+        message = data.get("message")
+    elif isinstance(data, dict):
+        message = data
+    else:
+        message = None
+
+    if not isinstance(message, dict):
+        return None
+
+    normalized = extract_basic_fields(message)
+    if any(value for value in normalized.values() if value is not None):
+        return normalized
+    return None
+
+
+def get_insolvencies_for_date(date_iso: str) -> Dict[str, Any]:
+    out_path = dump_konkurs_dekret(date_iso)
+    results: List[Dict[str, Any]] = []
+
+    seen: set[str] = set()
+    for json_file in sorted(out_path.glob("*.json")):
+        normalized = load_message(json_file)
+        if not normalized:
+            continue
+        msg_no = normalized.get("messageNumber")
+        if msg_no and msg_no in seen:
+            continue
+        if msg_no:
+            seen.add(msg_no)
+        results.append(normalized)
+
+    return {"date": date_iso, "count": len(results), "results": results}
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
+def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-def normalize_document_inplace(message: Dict) -> Dict:
-    """Ensure message.document is a JSON string and attach parsed version."""
-    doc = message.get("document")
-    if isinstance(doc, str):
-        parsed = json.loads(doc)
-    elif isinstance(doc, dict):
-        parsed = doc
-    else:
-        raise ValueError("document missing or invalid type")
-
-    if "fieldgroups" not in parsed or "defaultfieldgroups" not in parsed:
-        raise ValueError("document missing required keys")
-
-    message["_document_obj"] = parsed
-    message["document"] = json.dumps(parsed, ensure_ascii=False)
-    message["fieldGroups"] = parsed.get("fieldgroups", [])
-    message["defaultFieldGroups"] = parsed.get("defaultfieldgroups", [])
-    return message
+@app.get("/insolvencies/today")
+def insolvencies_today() -> Dict[str, Any]:
+    today_iso = date.today().isoformat()
+    return get_insolvencies_for_date(today_iso)
 
 
-def messagesearch_day(date_iso: str) -> Dict:
-    """Robust fetch for /api/messagesearch for a single date."""
-
-    session.headers.update({
-        "Referer": f"{BASE}/messages",
-        "Accept-Language": "da-DK,da;q=0.9,en;q=0.8",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-
-    def build_params(page: int, ps: int, o: int, include_m: bool) -> List[tuple]:
-        params = [
-            ("d", "false"),
-            ("fromDate", f"{date_iso}T00:00:00"),
-            ("toDate", f"{date_iso}T00:00:00"),
-            ("userOnly", "false"),
-            ("messagesforuser", ""),
-            ("o", str(o)),
-            ("page", str(page)),
-            ("ps", str(ps)),
-        ]
-        if include_m:
-            for m in [
-                "603102f09e3f5ad99538175719970bde",
-                "14a1d71df21558e5ade0214f90482cdc",
-                "24295ca1259a5876ba7bf8ef496feed6",
-                "383f18001b395f39825061a5c0798fad",
-                "018d01410efb5472a6989328817df00a",
-                "941c2e759f325408a946031217b6d669",
-            ]:
-                params.append(("m", m))
-        return params
-
-    def try_one(ps: int, o: int, include_m: bool) -> Dict | None:
-        url = f"{BASE}/api/messagesearch"
-        p = build_params(page=0, ps=ps, o=o, include_m=include_m)
-        r = session.get(url, params=p, timeout=20)
-        if r.status_code == 500:
-            return None
-        r.raise_for_status()
-        data = r.json()
-        results = list(data.get("results", []))
-        page_count = int(data.get("pageCount", 1))
-
-        # paginate through pages
-        for page in range(1, page_count):
-            p = build_params(page=page, ps=ps, o=o, include_m=include_m)
-            rr = session.get(url, params=p, timeout=20)
-            if rr.status_code == 500:
-                return None
-            rr.raise_for_status()
-            dd = rr.json()
-            results.extend(dd.get("results", []))
-            time.sleep(0.12)
-
-        return {"pageCount": page_count, "resultCount": len(results), "results": results}
-
-    attempts = [
-        (10, 40, True),
-        (10, 40, False),
-        (20, 40, False),
-        (10, 0, False),
-        (50, 0, False),
-    ]
-
-    last_err = None
-    for ps, o, include_m in attempts:
-        try:
-            out = try_one(ps=ps, o=o, include_m=include_m)
-            if out is not None:
-                return out
-        except requests.HTTPError as exc:  # pragma: no cover - network fallback
-            last_err = exc
-            time.sleep(0.15)
-
-    if last_err:
-        raise last_err
-    raise RuntimeError("messagesearch failed for all parameter combinations")
-
-
-def get_message_full(message_number: str) -> Dict:
-    """Fetch full message JSON like the frontend does."""
-    r = session.get(f"{BASE}/api/message/{message_number}", timeout=20)
-    r.raise_for_status()
-    payload = r.json()
-    msg = payload.get("message") or payload
-    normalize_document_inplace(msg)
-    return payload
-
-
-@app.get("/messages/{date_iso}")
-def api_messages(date_iso: str) -> Dict:
+@app.get("/insolvencies/{date_iso}")
+def insolvencies_by_date(date_iso: str) -> Dict[str, Any]:
     try:
-        return messagesearch_day(date_iso)
-    except requests.HTTPError as exc:  # pragma: no cover - network fallback
-        raise HTTPException(status_code=exc.response.status_code, detail=str(exc)) from exc
-
-
-@app.get("/messages/{date_iso}/dekret")
-def api_messages_dekret(date_iso: str) -> Dict:
-    search = api_messages(date_iso)
-    hits = [
-        r
-        for r in search.get("results", [])
-        if r.get("sectionName") == "Konkursboer" and r.get("messageTypeName") == "Dekret"
-    ]
-    enriched = []
-    for it in hits:
-        msg_no = it.get("messageNumber")
-        if not msg_no:
-            continue
-        payload = get_message_full(msg_no)
-        msg = payload.get("message") or payload
-        snapshot = {
-            "$id": "1",
-            "sectionName": msg.get("sectionName"),
-            "messageTypeName": msg.get("messageTypeName"),
-            "messageTypeId": msg.get("messageTypeId"),
-            "messageNumber": msg.get("messageNumber"),
-            "document": msg.get("document"),
-            "title": msg.get("title"),
-            "summaryFields": msg.get("summaryFields", []),
-            "state": msg.get("state"),
-            "logs": payload.get("logs", []),
-            "publicationDate": msg.get("publicationDate"),
-            "ownerName": msg.get("ownerName", ""),
-            "publicationId": msg.get("publicationId"),
-        }
-        enriched.append(snapshot)
-        time.sleep(0.2)
-    return {"resultCount": len(enriched), "results": enriched}
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8001")), reload=False)
+        date.fromisoformat(date_iso)
+    except ValueError as exc:  # pragma: no cover - validation fallback
+        raise HTTPException(status_code=400, detail="Invalid date format, expected YYYY-MM-DD") from exc
+    return get_insolvencies_for_date(date_iso)
