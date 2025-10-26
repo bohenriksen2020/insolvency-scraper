@@ -3,7 +3,7 @@ FROM mcr.microsoft.com/devcontainers/python:3.12-bookworm
 WORKDIR /workspace
 
 # Install FastAPI & Uvicorn
-RUN pip install --no-cache-dir fastapi uvicorn httpx python-dotenv requests dotenv
+RUN pip install --no-cache-dir fastapi uvicorn httpx python-dotenv requests dotenv cloudscraper lxml
 
 # Copy the local code into the container
 # (VS Code also mounts it live, so this helps for build-time commands)

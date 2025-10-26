@@ -5,7 +5,7 @@
   "overrideCommand": false,
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
   "workspaceFolder": "/workspace",
-  "runArgs": ["--init", "-p", "8000:8000"],
+  "runArgs": ["--init", "-p", "8000:8000", "--network", "host"],
   "customizations": {
     "vscode": {
       "extensions": [
