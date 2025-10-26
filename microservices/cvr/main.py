@@ -43,10 +43,11 @@ def assets(name: str):
     if not cvr:
         return {"query": name, "error": "No company under konkurs found"}
     data = fetch.fetch_company_data(cvr)
+    print(f"assets: found cvr: {cvr} with data: {data}")
     urls = fetch.find_latest_xbrl(data, cvr)
     if not urls or not urls[0]:
-        return {"cvr": cvr, "error": "No XBRL document found"}
+        return {"cvr": cvr, "assets": {"error": "No XBRL document found"}, "raw" : data}
     xml_bytes = fetch.download_xbrl(urls[0], urls[1])
     assets = fetch.parse_xbrl_assets(xml_bytes)
     formatted = [{"tag": t, "label": l, "value": v} for t, l, v in assets]
-    return {"cvr": cvr, "assets": formatted}
+    return {"cvr": cvr, "assets": formatted, "raw" : data}

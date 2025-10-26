@@ -42,9 +42,10 @@ class Fetch:
         payload = {"fritekstCommand": {"soegOrd": name, "sideIndex": "0", "size": ["10"]}}
         r = self.session.post(CVR_SEARCH_URL, json=payload)
         r.raise_for_status()
+        print(f"search_company returned {r.json()}")
         for e in r.json().get("enheder", []):
-            if e.get("status") == "UNDERKONKURS":
-                print(f"🏦 Found insolvent company: {e['senesteNavn']} ({e['cvr']})")
+            if e.get("status") in ["UNDERKONKURS", "OPLØSTEFTERKONKURS", "UNDERTVANGSOPLØSNING"] or e.get('cvr') is not None:
+                print(f"🏦 Found insolvent company: {e['senesteNavn']} ({e['cvr']}), status: {e.get("status")}")
                 return e["cvr"], e["senesteNavn"]
         print(f"⚠️ No company under konkurs found for '{name}'.")
         return None, None
@@ -86,7 +87,8 @@ class Fetch:
                 return r.content
             elif r.status_code == 403:
                 print("⚠️ Forbidden, trying next fallback...")
-        raise RuntimeError("❌ Unable to download XBRL XML from any URL.")
+        return {"status" : "❌ Unable to download XBRL XML from any URL."}
+        #raise RuntimeError("❌ Unable to download XBRL XML from any URL.")
 
     def parse_xbrl_assets(self, xml_content: bytes):
         tree = ET.parse(BytesIO(xml_content))

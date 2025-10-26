@@ -9,6 +9,9 @@ from typing import Any, Dict, List
 from fastapi import FastAPI, HTTPException
 
 from fetch import dump_konkurs_dekret
+import logging
+logging.basicConfig(level=logging.INFO)
+
 
 app = FastAPI(title="Statstidende Service")
 
@@ -29,8 +32,23 @@ SUMMARY_MAP = {
 }
 
 
-def parse_lawyer(text: str) -> Dict[str, str]:
-    match = LAWYER_RE.search(text or "")
+def parse_lawyer(text_or_obj: str | dict) -> Dict[str, str]:
+    """Extract lawyer info from text or structured message."""
+    if isinstance(text_or_obj, dict):
+        # structured data path
+        personkreds = text_or_obj.get("personkreds", {}).get("personkredser", [])
+        for role in personkreds:
+            rolle = role.get("rolle", {}).get("name", "")
+            if "LIKVIDATOR" in rolle.upper() or "KURATOR" in rolle.upper():
+                person = role.get("personRoller", [{}])[0]
+                return {
+                    "lawyer_name": person.get("senesteNavn"),
+                    "lawyer_city": person.get("adresse", "").split("\n")[-1] if person.get("adresse") else None,
+                }
+
+    # text fallback
+    text = text_or_obj if isinstance(text_or_obj, str) else json.dumps(text_or_obj, ensure_ascii=False)
+    match = LAWYER_RE.search(text)
     if not match:
         return {}
     return {
@@ -41,31 +59,68 @@ def parse_lawyer(text: str) -> Dict[str, str]:
 
 
 def extract_basic_fields(message: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract the normalized payload returned by the API."""
+    """Extract normalized payload from Statstidende message with nested JSON 'document' field."""
+    # --- decode the embedded document JSON if possible ---
+    doc = None
+    if isinstance(message.get("document"), str):
+        try:
+            doc = json.loads(message["document"])
+        except json.JSONDecodeError:
+            pass
+    elif isinstance(message.get("document"), dict):
+        doc = message["document"]
 
-    serialized = json.dumps(message, ensure_ascii=False)
-    lawyer = parse_lawyer(serialized)
-    cvr_match = CVR_RE.search(serialized)
-    cvr = cvr_match.group(1) if cvr_match else None
+    cvr = None
+    company_name = message.get("title") or message.get("ownerName")
+    court = None
+    lawyer_name = None
 
-    basic = {
+    if doc and isinstance(doc, dict):
+        for group in doc.get("fieldgroups", []):
+            name = group.get("name", "")
+            for field in group.get("fields", []):
+                field_name = (field.get("name") or "").lower()
+                value = field.get("value")
+
+                # CVR
+                if "cvr" in field_name and not cvr:
+                    cvr = re.sub(r"\D", "", value) if value else None
+
+                # Court
+                if "skifteret" in name.lower() or "skifteret" in field_name:
+                    court = value
+
+                # Lawyer
+                if "kurator" in name.lower():
+                    if value and "advokat" in value.lower():
+                        lawyer_name = value.replace("Advokat", "").strip()
+                    elif value and not lawyer_name:
+                        lawyer_name = value.strip()
+
+    # --- Fallbacks from summaryFields ---
+    for summary in message.get("summaryFields", []):
+        label = summary.get("name") or summary.get("label")
+        val = summary.get("value")
+        if not cvr and label and "cvr" in label.lower() and val:
+            cvr = re.sub(r"\D", "", val)
+        if not court and label and "ret" in label.lower():
+            court = val
+
+    # --- Assemble normalized output ---
+    result = {
         "messageNumber": message.get("messageNumber"),
         "publicationDate": message.get("publicationDate"),
-        "company_name": message.get("title") or message.get("ownerName"),
-        "cvr": message.get("cvr") or cvr,
-        "court": message.get("court") or message.get("publicationName"),
+        "company_name": company_name,
+        "cvr": cvr,
+        "court": court,
+        "lawyer_name": lawyer_name,
+        "raw": message,
     }
-    basic.update(lawyer)
 
-    # Fallback from summaryFields if available
-    for summary in message.get("summaryFields", []):
-        label = summary.get("label")
-        value = summary.get("value")
-        key = SUMMARY_MAP.get(label or "")
-        if key and value and not basic.get(key):
-            basic[key] = value
-
-    return basic
+    logging.info(
+        f"📦 Extracted → company={company_name} | cvr={cvr} | lawyer={lawyer_name} | court={court}"
+    )
+    return result
 
 
 def load_message(path: Path) -> Dict[str, Any] | None:

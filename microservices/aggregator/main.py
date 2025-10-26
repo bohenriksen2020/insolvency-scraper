@@ -1,14 +1,17 @@
-# Aggregator
-
 from fastapi import FastAPI, BackgroundTasks
 from datetime import date
 import requests
 import logging
 import random
 import time
+import os
+from sqlalchemy.orm import Session
+
+# Upsert company
+from sqlalchemy.inspection import inspect
+
 
 from db import SessionLocal, init_db
-import os
 from models import Company, Lawyer, InsolvencyCase
 from scheduler import start_scheduler
 
@@ -33,9 +36,67 @@ def safe_sleep(min_s: float = 0.5, max_s: float = 1.5) -> None:
 def health() -> dict:
     return {"status": "ok"}
 
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.inspection import inspect
+
+def upsert_company(session, case, cvr_data):
+    """Insert or update company safely, avoiding null CVR/name and stale sessions."""
+    try:
+        stamdata = cvr_data.get("stamdata", {}) or {}
+        udv = cvr_data.get("udvidedeOplysninger", {}) or {}
+
+        cvr = stamdata.get("cvrnummer") or case.get("cvr")
+        name = stamdata.get("navn") or case.get("company_name")
+
+        if not cvr:
+            logging.warning(f"⚠️ No CVR found in payload for {name}; skipping.")
+            return
+
+        if not name:
+            logging.warning(f"⚠️ No company name found for CVR {cvr}; skipping.")
+            return
+
+        company_fields = {
+            "cvr": cvr,
+            "name": name,
+            "status": stamdata.get("status") or "UKENDT",
+            "address": stamdata.get("adresse"),
+            "zip_city": stamdata.get("postnummerOgBy"),
+            "municipality": udv.get("kommune"),
+            "email": udv.get("email"),
+            "phone": udv.get("telefon"),
+            "industry_code": (udv.get("hovedbranche") or {}).get("branchekode"),
+            "industry_text": (udv.get("hovedbranche") or {}).get("titel"),
+            "purpose": udv.get("formaal"),
+            "raw_cvr": cvr_data,
+        }
+
+        # only keep existing columns to prevent TypeError
+        model_columns = {c.name for c in inspect(Company).columns}
+        valid_data = {k: v for k, v in company_fields.items() if k in model_columns}
+
+        existing = session.query(Company).filter(Company.cvr == cvr).first()
+        if existing:
+            for k, v in valid_data.items():
+                setattr(existing, k, v)
+            session.merge(existing)
+            logging.info(f"🔁 Updated existing company {name} ({cvr})")
+        else:
+            session.add(Company(**valid_data))
+            logging.info(f"➕ Created new company {name} ({cvr})")
+
+        session.commit()
+
+    except IntegrityError as ie:
+        session.rollback()
+        logging.error(f"❌ IntegrityError for company {case.get('company_name')} ({cvr}): {ie}")
+    except Exception as exc:
+        session.rollback()
+        logging.warning(f"⚠️ Unexpected error saving company {case.get('company_name')} ({cvr}): {exc}")
+
 
 def run_daily_sync(date_iso: str | None = None) -> None:
-    session = SessionLocal()
+    session: Session = SessionLocal()
     date_iso = date_iso or date.today().isoformat()
     logging.info(f"🔄 Running sync for {date_iso}")
 
@@ -43,37 +104,91 @@ def run_daily_sync(date_iso: str | None = None) -> None:
         response = requests.get(f"{STATSTIDENDE_URL}/insolvencies/{date_iso}", timeout=30)
         response.raise_for_status()
         insolvencies = response.json().get("results", [])
-    except Exception as exc:  # pragma: no cover - network errors
+    except Exception as exc:
         logging.error(f"❌ Failed fetching Statstidende data: {exc}")
         session.close()
         return
 
-    for index, case in enumerate(insolvencies, start=1):
-        cvr = case.get("cvr")
-        lawyer_name = case.get("lawyer_name")
-        logging.info(f"→ [{index}/{len(insolvencies)}] {case.get('company_name')}")
+    logging.info(f"Found {len(insolvencies)} insolvencies")
 
-        # --- CVR enrichment ---
+    for index, case in enumerate(insolvencies, start=1):
+        
+        lawyer_name = case.get("lawyer_name")
+        company_name = case.get("company_name")
+
+        logging.info(f"→ [{index}/{len(insolvencies)}] {company_name} with case: {case}")
+
+        # --- Always fetch CVR enrichment if CVR available ---
         assets = []
-        if cvr:
+        # --- Always fetch CVR enrichment if CVR available ---
+        if company_name:
+            cvr_number = None
             try:
-                cvr_response = requests.get(f"{CVR_URL}/assets/{cvr}", timeout=30)
+                cvr_response = requests.get(f"{CVR_URL}/assets/{company_name}", timeout=30)
                 cvr_response.raise_for_status()
                 cvr_data = cvr_response.json()
-                assets = cvr_data.get("assets", [])
-                company = Company(
-                    cvr=cvr,
-                    name=case.get("company_name"),
-                    status="UNDERKONKURS",
-                    assets=assets,
-                )
-                session.merge(company)
-                safe_sleep(0.8, 1.5)
-            except Exception as exc:  # pragma: no cover - network errors
-                logging.warning(f"⚠️ CVR failed for {cvr}: {exc}")
-                safe_sleep(1.0, 2.0)
+                cvr_number = cvr_data.get('cvr', None)
+                cvr_data = cvr_data.get("raw", cvr_data)
 
-        # --- Lawyer enrichment ---
+                logging.info(f"Got cvr data: {cvr_data}")
+                stamdata = cvr_data.get("stamdata", {})
+                udvidet = cvr_data.get("udvidedeOplysninger", {})
+                latest_regnskab = None
+
+                # Try to extract the most recent regnskab period
+                regnskaber = cvr_data.get("sammenhaengendeRegnskaber", [])
+                if regnskaber:
+                    latest_regnskab = regnskaber[0].get("periodeFormateret")
+
+                # Extract clean metadata for company
+                company_fields = {
+                    "cvr": cvr_number,
+                    "name": stamdata.get("navn"),
+                    "status": stamdata.get("status") or "UKENDT",
+                    "address": stamdata.get("adresse"),
+                    "zip_city": stamdata.get("postnummerOgBy"),
+                    "municipality": udvidet.get("kommune"),
+                    "phone": udvidet.get("telefon"),
+                    "email": udvidet.get("email"),
+                    "industry_code": udvidet.get("hovedbranche", {}).get("branchekode"),
+                    "industry_text": udvidet.get("hovedbranche", {}).get("titel"),
+                    "fiscal_year_end": udvidet.get("regnskabsaarSlut"),
+                    "fiscal_year_start": udvidet.get("regnskabsaarStart"),
+                    "capital": udvidet.get("registreretKapital"),
+                    "purpose": udvidet.get("formaal"),
+                    "latest_regnskab_period": latest_regnskab,
+                    "raw_cvr": cvr_data,  # keep full CVR payload
+                }
+
+                logging.info(f"🏦 Enriching {company_fields['name']} ({cvr_number})")
+                # Extract employee count safely
+                antal_ansatte = cvr_data.get("antalAnsatte", {}).get("maanedsbeskaeftigelse", [])
+                if antal_ansatte:
+                    employees_latest = antal_ansatte[-1].get("antalAnsatte", "N/A")
+                else:
+                    kvartal = cvr_data.get("antalAnsatte", {}).get("kvartalsbeskaeftigelse", [])
+                    employees_latest = kvartal[-1].get("antalAnsatte", "N/A") if kvartal else "N/A"
+
+                logging.info(
+                    f"📊 Industry: {company_fields.get('industry_text')} | "
+                    f"Employees: {employees_latest} | "
+                    f"Latest regnskab: {latest_regnskab}"
+                )
+                company_fields["employees_latest"] = employees_latest
+
+                # inside your CVR enrichment block
+                with session.no_autoflush:
+                    upsert_company(session, case, company_fields)
+                logging.info(f"Done with {stamdata.get("navn")}")
+                safe_sleep(1.0, 1.8)
+
+            except Exception as exc:
+                logging.warning(f"⚠️ CVR enrichment failed for {cvr_number}: {exc}")
+                safe_sleep(1.0, 2.0)
+        else:
+            logging.warning(f"⚠️ No CVR for {company_name}, skipping company creation")
+
+        # --- Always fetch lawyer enrichment ---
         lawyer_id = None
         if lawyer_name:
             try:
@@ -96,24 +211,28 @@ def run_daily_sync(date_iso: str | None = None) -> None:
                         cvr=firm.get("cvr"),
                         phone=firm.get("phone"),
                     )
-                    session.add(lawyer)
+                    with session.no_autoflush:
+                        session.merge(lawyer)
                     session.flush()
                     lawyer_id = lawyer.id
+                    logging.info(f"👩‍⚖️ Upserted lawyer {lawyer_name}")
                 safe_sleep(1.2, 2.5)
-            except Exception as exc:  # pragma: no cover - network errors
-                logging.warning(f"⚠️ Lawyer lookup failed for {lawyer_name}: {exc}")
+            except Exception as exc:
+                logging.warning(f"⚠️ Lawyer fetch failed for {lawyer_name}: {exc}")
                 safe_sleep(1.0, 2.0)
 
+        # --- Upsert InsolvencyCase ---
         insolvency = InsolvencyCase(
             message_number=case.get("messageNumber"),
             publication_date=case.get("publicationDate"),
-            company_name=case.get("company_name"),
-            cvr=cvr,
+            company_name=company_name,
+            cvr=cvr_number,
             court=case.get("court"),
             lawyer_id=lawyer_id,
             raw=case,
         )
-        session.add(insolvency)
+        with session.no_autoflush:
+            session.merge(insolvency)
         session.commit()
 
         safe_sleep(0.3, 0.8)
