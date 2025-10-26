@@ -91,23 +91,91 @@ class Fetch:
         #raise RuntimeError("❌ Unable to download XBRL XML from any URL.")
 
     def parse_xbrl_assets(self, xml_content: bytes):
-        tree = ET.parse(BytesIO(xml_content))
+        """
+        Parse XBRL XML and extract key asset/liability fields across
+        Danish GAAP (danGAAP), IFRS, and other namespaces.
+        Returns a list of dicts with tag, label, and numeric value (float).
+        """
+        if isinstance(xml_content, dict):  # fallback if download failed
+            return []
+
+        import re
+        import xml.etree.ElementTree as ET
+        from io import BytesIO
+
+        try:
+            tree = ET.parse(BytesIO(xml_content))
+        except Exception as e:
+            print(f"⚠️ Failed parsing XBRL XML: {e}")
+            return []
+
         root = tree.getroot()
         results = []
-        for tag, name in ASSET_TAGS.items():
-            local_tag = tag.split(":")[1]
-            values = []
-            for el in root.iter():
-                if el.tag.endswith(local_tag):
-                    try:
-                        val = float(el.text.strip().replace(",", "."))
-                        values.append(val)
-                    except (ValueError, AttributeError):
-                        continue
-            if values:
-                results.append((tag, name, max(values)))
-        return results
 
+        FIELD_MAP = {
+            # Tangible assets
+            "PropertyPlantAndEquipment": "Tangible assets (IFRS)",
+            "TangibleFixedAssets": "Tangible assets (Danish GAAP)",
+            "LandAndBuildings": "Land and buildings",
+            "Buildings": "Buildings",
+            "Vehicles": "Vehicles",
+            "FixturesAndFittingsToolsAndEquipment": "Fixtures, fittings & tools",
+            "OtherTangibleFixedAssets": "Other tangible fixed assets",
+
+            # Intangible assets
+            "IntangibleAssets": "Intangible assets",
+            "Goodwill": "Goodwill",
+            "DevelopmentCosts": "Development costs",
+
+            # Inventories
+            "Inventories": "Inventories",
+            "RawMaterialsAndConsumables": "Raw materials & consumables",
+            "FinishedGoodsAndGoodsForResale": "Finished goods & resale goods",
+
+            # Liabilities & equity
+            "Equity": "Equity",
+            "Provisions": "Provisions",
+            "LongTermDebt": "Long-term debt",
+            "ShortTermDebt": "Short-term debt",
+            "CurrentLiabilities": "Current liabilities",
+            "TotalLiabilitiesAndEquity": "Liabilities + Equity (total)",
+        }
+
+        def to_float(value: str):
+            """Convert number-like strings to float safely."""
+            if not value:
+                return None
+            cleaned = re.sub(r"[^\d,.\-]", "", value).replace(",", ".")
+            try:
+                return float(cleaned)
+            except ValueError:
+                return None
+
+        for key, label in FIELD_MAP.items():
+            numbers = []
+            for el in root.iter():
+                if el.tag.endswith(key):
+                    num = to_float(el.text.strip() if el.text else "")
+                    if isinstance(num, (float, int)) and num != 0:
+                        numbers.append(num)
+            if numbers:
+                results.append({
+                    "tag": key,
+                    "label": label,
+                    "value": float(max(numbers)),  # ensure float type
+                })
+
+        order = [
+            "Tangible assets (Danish GAAP)", "Tangible assets (IFRS)",
+            "Land and buildings", "Buildings", "Vehicles",
+            "Fixtures, fittings & tools", "Other tangible fixed assets",
+            "Intangible assets", "Goodwill", "Development costs",
+            "Inventories", "Raw materials & consumables", "Finished goods & resale goods",
+            "Equity", "Provisions", "Long-term debt", "Short-term debt",
+            "Current liabilities", "Liabilities + Equity (total)"
+        ]
+        results.sort(key=lambda x: order.index(x["label"]) if x["label"] in order else len(order))
+        return results
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch and parse XBRL for an insolvent company.")
@@ -123,12 +191,20 @@ def main():
     if not urls:
         return
     xml = fetch.download_xbrl(*urls)
+    print(xml)
     assets = fetch.parse_xbrl_assets(xml)
     print("\n📊 Tangible Asset Overview:\n")
     print("| XBRL Field | English Name | Value (DKK) |")
     print("|-------------|--------------|--------------|")
-    for tag, label, val in assets:
-        print(f"| {tag} | {label} | {val:,.0f} |")
+    for item in assets:
+        tag = item.get("tag", "")
+        label = item.get("label", "")
+        val = item.get("value", "")
+        if isinstance(val, (int, float)):
+            print(f"| {tag} | {label} | {val:,.0f} |")
+        else:
+            print(f"| {tag} | {label} | {val} |")
+
 
 
 if __name__ == "__main__":

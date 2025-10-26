@@ -47,7 +47,7 @@ def upsert_company(session, case, cvr_data):
 
         cvr = stamdata.get("cvrnummer") or case.get("cvr")
         name = stamdata.get("navn") or case.get("company_name")
-
+        assets = cvr_data.get("assets")
         if not cvr:
             logging.warning(f"⚠️ No CVR found in payload for {name}; skipping.")
             return
@@ -59,6 +59,7 @@ def upsert_company(session, case, cvr_data):
         company_fields = {
             "cvr": cvr,
             "name": name,
+            "assets": assets,
             "status": stamdata.get("status") or "UKENDT",
             "address": stamdata.get("adresse"),
             "zip_city": stamdata.get("postnummerOgBy"),
@@ -128,15 +129,17 @@ def run_daily_sync(date_iso: str | None = None) -> None:
                 cvr_response.raise_for_status()
                 cvr_data = cvr_response.json()
                 cvr_number = cvr_data.get('cvr', None)
-                cvr_data = cvr_data.get("raw", cvr_data)
+                assets = cvr_data.get('assets', None)
+                status = cvr_data.get('status', "UKNOWN")
+                raw = cvr_data.get("raw", cvr_data)
 
                 logging.info(f"Got cvr data: {cvr_data}")
-                stamdata = cvr_data.get("stamdata", {})
-                udvidet = cvr_data.get("udvidedeOplysninger", {})
+                stamdata = raw.get("stamdata", {})
+                udvidet = raw.get("udvidedeOplysninger", {})
                 latest_regnskab = None
 
                 # Try to extract the most recent regnskab period
-                regnskaber = cvr_data.get("sammenhaengendeRegnskaber", [])
+                regnskaber = raw.get("sammenhaengendeRegnskaber", [])
                 if regnskaber:
                     latest_regnskab = regnskaber[0].get("periodeFormateret")
 
@@ -144,7 +147,8 @@ def run_daily_sync(date_iso: str | None = None) -> None:
                 company_fields = {
                     "cvr": cvr_number,
                     "name": stamdata.get("navn"),
-                    "status": stamdata.get("status") or "UKENDT",
+                    "assets": assets,
+                    "status": status, 
                     "address": stamdata.get("adresse"),
                     "zip_city": stamdata.get("postnummerOgBy"),
                     "municipality": udvidet.get("kommune"),
@@ -157,16 +161,17 @@ def run_daily_sync(date_iso: str | None = None) -> None:
                     "capital": udvidet.get("registreretKapital"),
                     "purpose": udvidet.get("formaal"),
                     "latest_regnskab_period": latest_regnskab,
-                    "raw_cvr": cvr_data,  # keep full CVR payload
+                    "raw_cvr": raw,  # keep full CVR payload
                 }
 
                 logging.info(f"🏦 Enriching {company_fields['name']} ({cvr_number})")
+                logging.info(company_fields)
                 # Extract employee count safely
-                antal_ansatte = cvr_data.get("antalAnsatte", {}).get("maanedsbeskaeftigelse", [])
+                antal_ansatte = raw.get("antalAnsatte", {}).get("maanedsbeskaeftigelse", [])
                 if antal_ansatte:
                     employees_latest = antal_ansatte[-1].get("antalAnsatte", "N/A")
                 else:
-                    kvartal = cvr_data.get("antalAnsatte", {}).get("kvartalsbeskaeftigelse", [])
+                    kvartal = raw.get("antalAnsatte", {}).get("kvartalsbeskaeftigelse", [])
                     employees_latest = kvartal[-1].get("antalAnsatte", "N/A") if kvartal else "N/A"
 
                 logging.info(
