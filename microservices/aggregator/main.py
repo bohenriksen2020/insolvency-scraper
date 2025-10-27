@@ -42,39 +42,13 @@ from sqlalchemy.inspection import inspect
 def upsert_company(session, case, cvr_data):
     """Insert or update company safely, avoiding null CVR/name and stale sessions."""
     try:
-        stamdata = cvr_data.get("stamdata", {}) or {}
-        udv = cvr_data.get("udvidedeOplysninger", {}) or {}
-
-        cvr = stamdata.get("cvrnummer") or case.get("cvr")
-        name = stamdata.get("navn") or case.get("company_name")
-        assets = cvr_data.get("assets")
-        if not cvr:
-            logging.warning(f"⚠️ No CVR found in payload for {name}; skipping.")
-            return
-
-        if not name:
-            logging.warning(f"⚠️ No company name found for CVR {cvr}; skipping.")
-            return
-
-        company_fields = {
-            "cvr": cvr,
-            "name": name,
-            "assets": assets,
-            "status": stamdata.get("status") or "UKENDT",
-            "address": stamdata.get("adresse"),
-            "zip_city": stamdata.get("postnummerOgBy"),
-            "municipality": udv.get("kommune"),
-            "email": udv.get("email"),
-            "phone": udv.get("telefon"),
-            "industry_code": (udv.get("hovedbranche") or {}).get("branchekode"),
-            "industry_text": (udv.get("hovedbranche") or {}).get("titel"),
-            "purpose": udv.get("formaal"),
-            "raw_cvr": cvr_data,
-        }
-
+       
+       
+        cvr = cvr_data.get('cvr')
+        name = cvr_data.get('name')
         # only keep existing columns to prevent TypeError
         model_columns = {c.name for c in inspect(Company).columns}
-        valid_data = {k: v for k, v in company_fields.items() if k in model_columns}
+        valid_data = {k: v for k, v in cvr_data.items() if k in model_columns}
 
         existing = session.query(Company).filter(Company.cvr == cvr).first()
         if existing:
@@ -130,7 +104,6 @@ def run_daily_sync(date_iso: str | None = None) -> None:
                 cvr_data = cvr_response.json()
                 cvr_number = cvr_data.get('cvr', None)
                 assets = cvr_data.get('assets', None)
-                status = cvr_data.get('status', "UKNOWN")
                 raw = cvr_data.get("raw", cvr_data)
 
                 logging.info(f"Got cvr data: {cvr_data}")
@@ -148,7 +121,7 @@ def run_daily_sync(date_iso: str | None = None) -> None:
                     "cvr": cvr_number,
                     "name": stamdata.get("navn"),
                     "assets": assets,
-                    "status": status, 
+                    "status": stamdata.get("status", "UNKNOWN"), 
                     "address": stamdata.get("adresse"),
                     "zip_city": stamdata.get("postnummerOgBy"),
                     "municipality": udvidet.get("kommune"),
@@ -164,8 +137,8 @@ def run_daily_sync(date_iso: str | None = None) -> None:
                     "raw_cvr": raw,  # keep full CVR payload
                 }
 
-                logging.info(f"🏦 Enriching {company_fields['name']} ({cvr_number})")
-                logging.info(company_fields)
+                logging.info(f"🏦 Enriching {company_fields['name']} ({cvr_number}), status: {company_fields['status']}")
+                # logging.info(company_fields)
                 # Extract employee count safely
                 antal_ansatte = raw.get("antalAnsatte", {}).get("maanedsbeskaeftigelse", [])
                 if antal_ansatte:
