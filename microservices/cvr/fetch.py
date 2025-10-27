@@ -8,22 +8,22 @@ import argparse
 import xml.etree.ElementTree as ET
 from io import BytesIO
 import cloudscraper
-
+import re 
 BASE_URL = "https://datacvr.virk.dk"
 CVR_SEARCH_URL = f"{BASE_URL}/gateway/soeg/fritekst"
 COMPANY_URL = f"{BASE_URL}/gateway/virksomhed/hentVirksomhed"
 
 ASSET_TAGS = {
     "e:FixturesAndFittingsToolsAndEquipment": "Fixtures, fittings, tools and equipment",
+    "e:FixturesFittingsToolsAndEquipment": "Fixtures, fittings, tools and equipment",
+    "e:PropertyPlantAndEquipment": "Property, plant and equipment (total)",
     "e:OtherTangibleFixedAssets": "Other tangible fixed assets",
-    "e:Inventories": "Inventories",
-    "fsa:RawMaterialsAndConsumables": "Inventories (Raw materials and consumables)",
-    "fsa:FinishedGoodsAndGoodsForResale": "Inventories (Finished goods and resale)",
     "e:LandAndBuildings": "Land and buildings",
     "e:Vehicles": "Vehicles",
-    "e:TangibleFixedAssets": "Tangible fixed assets, total",
+    "e:Inventories": "Inventories",
+    "e:RawMaterialsAndConsumables": "Inventories (raw materials and consumables)",
+    "e:FinishedGoodsAndGoodsForResale": "Inventories (finished goods and goods for resale)",
 }
-
 
 class Fetch:
     def __init__(self):
@@ -91,17 +91,9 @@ class Fetch:
         #raise RuntimeError("❌ Unable to download XBRL XML from any URL.")
 
     def parse_xbrl_assets(self, xml_content: bytes):
-        """
-        Parse XBRL XML and extract key asset/liability fields across
-        Danish GAAP (danGAAP), IFRS, and other namespaces.
-        Returns a list of dicts with tag, label, and numeric value (float).
-        """
-        if isinstance(xml_content, dict):  # fallback if download failed
+        """Extract asset fields from XBRL XML using ASSET_TAGS."""
+        if isinstance(xml_content, dict):
             return []
-
-        import re
-        import xml.etree.ElementTree as ET
-        from io import BytesIO
 
         try:
             tree = ET.parse(BytesIO(xml_content))
@@ -112,37 +104,7 @@ class Fetch:
         root = tree.getroot()
         results = []
 
-        FIELD_MAP = {
-            # Tangible assets
-            "PropertyPlantAndEquipment": "Tangible assets (IFRS)",
-            "TangibleFixedAssets": "Tangible assets (Danish GAAP)",
-            "LandAndBuildings": "Land and buildings",
-            "Buildings": "Buildings",
-            "Vehicles": "Vehicles",
-            "FixturesAndFittingsToolsAndEquipment": "Fixtures, fittings & tools",
-            "OtherTangibleFixedAssets": "Other tangible fixed assets",
-
-            # Intangible assets
-            "IntangibleAssets": "Intangible assets",
-            "Goodwill": "Goodwill",
-            "DevelopmentCosts": "Development costs",
-
-            # Inventories
-            "Inventories": "Inventories",
-            "RawMaterialsAndConsumables": "Raw materials & consumables",
-            "FinishedGoodsAndGoodsForResale": "Finished goods & resale goods",
-
-            # Liabilities & equity
-            "Equity": "Equity",
-            "Provisions": "Provisions",
-            "LongTermDebt": "Long-term debt",
-            "ShortTermDebt": "Short-term debt",
-            "CurrentLiabilities": "Current liabilities",
-            "TotalLiabilitiesAndEquity": "Liabilities + Equity (total)",
-        }
-
         def to_float(value: str):
-            """Convert number-like strings to float safely."""
             if not value:
                 return None
             cleaned = re.sub(r"[^\d,.\-]", "", value).replace(",", ".")
@@ -151,30 +113,23 @@ class Fetch:
             except ValueError:
                 return None
 
-        for key, label in FIELD_MAP.items():
+        for full_tag, label in ASSET_TAGS.items():
+            short_tag = full_tag.split(":")[-1]
             numbers = []
             for el in root.iter():
-                if el.tag.endswith(key):
+                if el.tag.endswith(short_tag):
                     num = to_float(el.text.strip() if el.text else "")
                     if isinstance(num, (float, int)) and num != 0:
                         numbers.append(num)
             if numbers:
                 results.append({
-                    "tag": key,
+                    "tag": full_tag,
                     "label": label,
-                    "value": float(max(numbers)),  # ensure float type
+                    "value": float(max(numbers)),
                 })
 
-        order = [
-            "Tangible assets (Danish GAAP)", "Tangible assets (IFRS)",
-            "Land and buildings", "Buildings", "Vehicles",
-            "Fixtures, fittings & tools", "Other tangible fixed assets",
-            "Intangible assets", "Goodwill", "Development costs",
-            "Inventories", "Raw materials & consumables", "Finished goods & resale goods",
-            "Equity", "Provisions", "Long-term debt", "Short-term debt",
-            "Current liabilities", "Liabilities + Equity (total)"
-        ]
-        results.sort(key=lambda x: order.index(x["label"]) if x["label"] in order else len(order))
+        ordered = list(ASSET_TAGS.keys())
+        results.sort(key=lambda x: ordered.index(x["tag"]) if x["tag"] in ordered else len(ordered))
         return results
 
 def main():
