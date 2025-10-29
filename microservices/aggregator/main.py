@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from datetime import date
 import requests
 import logging
@@ -95,9 +95,10 @@ def run_daily_sync(date_iso: str | None = None) -> None:
 
         # --- Always fetch CVR enrichment if CVR available ---
         assets = []
-        # --- Always fetch CVR enrichment if CVR available ---
+        cvr_number = None
+        company_fields = None
+        company_label = company_name
         if company_name:
-            cvr_number = None
             try:
                 cvr_response = requests.get(f"{CVR_URL}/assets/{company_name}", timeout=30)
                 cvr_response.raise_for_status()
@@ -121,7 +122,7 @@ def run_daily_sync(date_iso: str | None = None) -> None:
                     "cvr": cvr_number,
                     "name": stamdata.get("navn"),
                     "assets": assets,
-                    "status": stamdata.get("status", "UNKNOWN"), 
+                    "status": stamdata.get("status", "UNKNOWN"),
                     "address": stamdata.get("adresse"),
                     "zip_city": stamdata.get("postnummerOgBy"),
                     "municipality": udvidet.get("kommune"),
@@ -137,6 +138,7 @@ def run_daily_sync(date_iso: str | None = None) -> None:
                     "raw_cvr": raw,  # keep full CVR payload
                 }
 
+                company_label = company_fields["name"]
                 logging.info(f"🏦 Enriching {company_fields['name']} ({cvr_number}), status: {company_fields['status']}")
                 # logging.info(company_fields)
                 # Extract employee count safely
@@ -153,11 +155,6 @@ def run_daily_sync(date_iso: str | None = None) -> None:
                     f"Latest regnskab: {latest_regnskab}"
                 )
                 company_fields["employees_latest"] = employees_latest
-
-                # inside your CVR enrichment block
-                with session.no_autoflush:
-                    upsert_company(session, case, company_fields)
-                logging.info(f"Done with {stamdata.get("navn")}")
                 safe_sleep(1.0, 1.8)
 
             except Exception as exc:
@@ -198,6 +195,13 @@ def run_daily_sync(date_iso: str | None = None) -> None:
             except Exception as exc:
                 logging.warning(f"⚠️ Lawyer fetch failed for {lawyer_name}: {exc}")
                 safe_sleep(1.0, 2.0)
+
+        if company_fields:
+            if lawyer_id is not None:
+                company_fields["lawyer_id"] = lawyer_id
+            with session.no_autoflush():
+                upsert_company(session, case, company_fields)
+            logging.info(f"Done with {company_label}")
 
         # --- Upsert InsolvencyCase ---
         insolvency = InsolvencyCase(
@@ -253,3 +257,40 @@ def get_recent() -> dict:
     ]
     session.close()
     return {"count": len(results), "results": results}
+
+@app.get("/lawyers/{lawyer_id}")
+def get_lawyer_with_cases(lawyer_id: int) -> dict:
+    session = SessionLocal()
+    lawyer = session.query(Lawyer).filter(Lawyer.id == lawyer_id).first()
+    if not lawyer:
+        session.close()
+        raise HTTPException(status_code=404, detail="Lawyer not found")
+
+    cases = [
+        {
+            "id": insolvency.id,
+            "company": insolvency.company_name,
+            "cvr": insolvency.cvr,
+            "court": insolvency.court,
+            "publication_date": insolvency.publication_date,
+        }
+        for insolvency in sorted(
+            lawyer.cases,
+            key=lambda entry: entry.publication_date or "",
+            reverse=True,
+        )
+    ]
+
+    response = {
+        "id": lawyer.id,
+        "name": lawyer.name,
+        "firm": lawyer.firm,
+        "city": lawyer.city,
+        "email": lawyer.email,
+        "cvr": lawyer.cvr,
+        "phone": lawyer.phone,
+        "cases": cases,
+    }
+
+    session.close()
+    return response
