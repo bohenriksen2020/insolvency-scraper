@@ -16,6 +16,9 @@ class Lawyer(Base):
     phone = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+    cases = relationship("InsolvencyCase", back_populates="lawyer")
+    companies = relationship("Company", back_populates="lawyer")
+
 
 class Company(Base):
     __tablename__ = "companies"
@@ -23,7 +26,11 @@ class Company(Base):
     name = Column(String)
     status = Column(String)
     assets = Column(JSON)
+    lawyer_id = Column(Integer, ForeignKey("lawyers.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    lawyer = relationship("Lawyer", back_populates="companies")
+    cases = relationship("InsolvencyCase", back_populates="company")
 
 
 class InsolvencyCase(Base):
@@ -38,5 +45,5 @@ class InsolvencyCase(Base):
     raw = Column(JSON)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-    company = relationship("Company")
-    lawyer = relationship("Lawyer")
+    company = relationship("Company", back_populates="cases")
+    lawyer = relationship("Lawyer", back_populates="cases")
