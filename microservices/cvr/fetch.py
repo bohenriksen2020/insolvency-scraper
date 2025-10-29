@@ -44,9 +44,25 @@ class Fetch:
         r.raise_for_status()
         print(f"search_company returned {r.json()}")
         for e in r.json().get("enheder", []):
-            if e.get("status") in ["UNDERKONKURS", "OPLØSTEFTERKONKURS", "UNDERTVANGSOPLØSNING"] or e.get('cvr') is not None:
-                print(f"🏦 Found insolvent company: {e['senesteNavn']} ({e['cvr']}), status: {e.get("status")}")
+            status = (e.get("status") or "").upper()
+            insolvent_states = [
+                "UNDERKONKURS",
+                "OPLØSTEFTERKONKURS",
+                "UNDERTVANGSOPLØSNING",
+                "UNDERLIKVIDATION",
+                "UNDER FRIVILLIG LIKVIDATION",
+                "LIKVIDATION",
+                "UNDERREKONSTRUKTION",
+            ]
+
+            if any(s in status for s in insolvent_states):
+                print(f"🏦 Found matching company: {e['senesteNavn']} ({e['cvr']}), status: {status}")
                 return e["cvr"], e["senesteNavn"]
+        # Retry stripped name (remove "under likvidation" etc.)
+        clean_name = re.sub(r"\b(under|i|efter)\s+\w+", "", name, flags=re.IGNORECASE).strip()
+        if clean_name != name:
+            print(f"🔁 Retrying search with cleaned name: '{clean_name}'")
+            return self.search_company(clean_name)            
         print(f"⚠️ No company under konkurs found for '{name}'.")
         return None, None
 
@@ -75,6 +91,8 @@ class Fetch:
                 url_public = f"{BASE_URL}/dokument/{dokument_id}"
                 print(f"✅ Found XBRL document ID: {dokument_id}")
                 return url_gateway, url_public
+
+
         print("⚠️ No XBRL (XML) document found in latest regnskab.")
         return None, None
 
